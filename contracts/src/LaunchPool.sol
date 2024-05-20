@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {CErc20} from "../lib/clm/src/CErc20.sol";
 import {Comptroller} from "../lib/clm/src/Comptroller.sol";
-import {console} from "forge-std/Test.sol";
 
 interface BaseV1Router01 {
     function addLiquidity(
@@ -21,7 +21,10 @@ interface BaseV1Router01 {
     ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
 }
 
-// This implementation is developed for Testnet only.
+/**
+ * @title LaunchPool
+ * @dev Contract for managing token sales, airdrops, and liquidity on DEXs.
+ */
 contract LaunchPool is ERC20 {
     uint256 public maxSupply;
     uint256 public allocatedSupply;
@@ -29,8 +32,9 @@ contract LaunchPool is ERC20 {
     uint256 public creatorSupply;
     uint256 public saleStartTime;
     uint256 public saleDuration;
+
+    bytes32 public merkleRootForWhitelists;
     address public creator;
-    address[] public whitelist;
 
     // this is for testnet only - [NOTE, USDC, USDT, ETH, ATOM]
     address[5] public assets = [
@@ -41,7 +45,6 @@ contract LaunchPool is ERC20 {
         0x40E41DC5845619E7Ba73957449b31DFbfB9678b2
     ];
     mapping(address => address) public cTokenMapping;
-    uint256[] public amounts;
 
     // ratios denote how many tokens will a buyer get in exchange of existing token
     // for eg. ratios[0] = 10*10**18 meaning each user will get 10 tokens for each NOTE
@@ -54,7 +57,67 @@ contract LaunchPool is ERC20 {
     address[] public buyers;
     mapping(address => bool) exists;
     mapping(address => uint256) buyerAmounts;
+    mapping(address => bool) public whitelistClaimed;
 
+    // Custom errors
+    /**
+     * @dev The amount provided is invalid.
+     */
+    error InvalidAmount();
+
+    /**
+     * @dev The token sale has maxed out.
+     */
+    error SaleMaxedOut();
+
+    /**
+     * @dev Failed to transfer asset tokens.
+     */
+    error TransferFailed();
+
+    /**
+     * @dev The token sale has ended.
+     */
+    error SaleEnded();
+
+    /**
+     * @dev Airdrop has already taken place.
+     */
+    error AirdropAlreadyDone();
+
+    /**
+     * @dev Airdrop is not available yet.
+     */
+    error AirdropNotAvailable();
+
+    /**
+     * @dev Creator drop has already taken place.
+     */
+    error CreatorDropAlreadyDone();
+
+    /**
+     * @dev Creator drop is not available yet.
+     */
+    error CreatorDropNotAvailable();
+
+    /**
+     * @dev Tokens have already been claimed.
+     */
+    error TokensAlreadyClaimed();
+
+    /**
+     * @dev Constructs the LaunchPool contract.
+     * @param name The name of the token.
+     * @param symbol The symbol of the token.
+     * @param _maxSupply The maximum supply of the token.
+     * @param _creatorSupply The supply allocated to the creator.
+     * @param _allocatedSupply The allocated supply for the sale.
+     * @param _saleStartTime The start time of the token sale.
+     * @param _saleDuration The duration of the token sale.
+     * @param _creator The address of the creator.
+     * @param _root The Merkle root for whitelisted addresses.
+     * @param _ratios The ratios used in the sale.
+     */
     constructor(
         string memory name,
         string memory symbol,
@@ -64,8 +127,7 @@ contract LaunchPool is ERC20 {
         uint256 _saleStartTime,
         uint256 _saleDuration,
         address _creator,
-        address[] memory _whitelist,
-        uint256[] memory _amounts,
+        bytes32 _root,
         uint256[5] memory _ratios
     ) ERC20(name, symbol) {
         maxSupply = _maxSupply;
@@ -75,31 +137,57 @@ contract LaunchPool is ERC20 {
         saleStartTime = _saleStartTime;
         saleDuration = _saleDuration;
         creator = _creator;
-        whitelist = _whitelist;
-        amounts = _amounts;
+        merkleRootForWhitelists = _root;
         ratios = _ratios;
         // asset -> cAsset
-        cTokenMapping[0x03F734Bd9847575fDbE9bEaDDf9C166F880B5E5f] = 0x04E52476d318CdF739C38BD41A922787D441900c;
-        cTokenMapping[0xc51534568489f47949A828C8e3BF68463bdF3566] = 0x9160c5760a540cAfA24F90102cAA14C50497d5b7;
-        cTokenMapping[0x4fC30060226c45D8948718C95a78dFB237e88b40] = 0x3BEe0A8209e6F8c5c743F21e0cA99F2cb780D0D8;
-        cTokenMapping[0xCa03230E7FB13456326a234443aAd111AC96410A] = 0x260fCD909ab9dfF97B03591F83BEd5bBfc89A571;
-        cTokenMapping[0x40E41DC5845619E7Ba73957449b31DFbfB9678b2] = 0x90FCcb79Ad6f013A4bf62Ad43577eed7a8eb961B;
+        cTokenMapping[
+            0x03F734Bd9847575fDbE9bEaDDf9C166F880B5E5f
+        ] = 0x04E52476d318CdF739C38BD41A922787D441900c;
+        cTokenMapping[
+            0xc51534568489f47949A828C8e3BF68463bdF3566
+        ] = 0x9160c5760a540cAfA24F90102cAA14C50497d5b7;
+        cTokenMapping[
+            0x4fC30060226c45D8948718C95a78dFB237e88b40
+        ] = 0x3BEe0A8209e6F8c5c743F21e0cA99F2cb780D0D8;
+        cTokenMapping[
+            0xCa03230E7FB13456326a234443aAd111AC96410A
+        ] = 0x260fCD909ab9dfF97B03591F83BEd5bBfc89A571;
+        cTokenMapping[
+            0x40E41DC5845619E7Ba73957449b31DFbfB9678b2
+        ] = 0x90FCcb79Ad6f013A4bf62Ad43577eed7a8eb961B;
         // setting all bools to false
         airdropped = false;
         whitelistdropped = false;
         creatordropped = false;
     }
 
+    /**
+     * @dev Allows users to buy tokens during the sale period.
+     * @param asset_index The index of the asset being used to buy tokens.
+     * @param amount The amount of tokens to buy.
+     */
     function buy(uint8 asset_index, uint256 amount) external {
-        require(amount > 0, "Invalid amount!");
+        if (amount <= 0) {
+            revert InvalidAmount();
+        }
         uint256 ratio = ratios[asset_index];
         uint256 requiredAmount = amount * ratio;
-        require(allocatedSupply + amount <= maxSupply - reservedSupply, "token sale has maxed out");
-        require(
-            IERC20(assets[asset_index]).transferFrom(msg.sender, address(this), requiredAmount),
-            "Failed to transfer asset tokens!"
-        );
-        if (block.timestamp >= saleStartTime && block.timestamp <= saleStartTime + saleDuration) {
+        if (allocatedSupply + amount > maxSupply - reservedSupply) {
+            revert SaleMaxedOut();
+        }
+        if (
+            !IERC20(assets[asset_index]).transferFrom(
+                msg.sender,
+                address(this),
+                requiredAmount
+            )
+        ) {
+            revert TransferFailed();
+        }
+        if (
+            block.timestamp >= saleStartTime &&
+            block.timestamp <= saleStartTime + saleDuration
+        ) {
             if (!exists[msg.sender]) {
                 buyers.push(msg.sender);
                 exists[msg.sender] = true;
@@ -110,13 +198,52 @@ contract LaunchPool is ERC20 {
                 allocatedSupply += amount;
             }
         } else {
-            revert("Token sale has ended!");
+            revert SaleEnded();
         }
     }
 
+    /**
+     * @dev Verifies the Merkle proof and mints tokens to the whitelisted address.
+     * @param proof The Merkle proof.
+     * @param addr The address to claim tokens for.
+     * @param amount The amount of tokens to claim.
+     */
+    function claim(
+        bytes32[] memory proof,
+        address addr,
+        uint256 amount
+    ) public {
+        if (block.timestamp <= saleStartTime + saleDuration) {
+            revert AirdropNotAvailable();
+        }
+
+        if (whitelistClaimed[addr]) {
+            revert TokensAlreadyClaimed();
+        }
+
+        bytes32 leaf = keccak256(
+            bytes.concat(keccak256(abi.encode(addr, amount)))
+        );
+
+        require(
+            MerkleProof.verify(proof, merkleRootForWhitelists, leaf),
+            "Invalid proof"
+        );
+
+        whitelistClaimed[addr] = true;
+        _mint(addr, amount);
+    }
+
+    /**
+     * @dev Airdrops tokens to buyers after the sale has ended.
+     */
     function airdrop() external {
-        require(airdropped == false, "airdrop already took place, check your wallet");
-        require(block.timestamp > saleStartTime + saleDuration, "airdrop not available yet!");
+        if (airdropped) {
+            revert AirdropAlreadyDone();
+        }
+        if (block.timestamp <= saleStartTime + saleDuration) {
+            revert AirdropNotAvailable();
+        }
 
         clm_and_dex_calls();
 
@@ -131,27 +258,32 @@ contract LaunchPool is ERC20 {
         airdropped = true;
     }
 
-    function whitelistdrop() external {
-        require(whitelistdropped == false, "whitelist drop already took place, check your wallet");
-        require(block.timestamp > saleStartTime + saleDuration + (86400 * 90), "whitelist drop not available yet!");
-        for (uint256 i = 0; i < whitelist.length; i++) {
-            uint256 amount = amounts[i];
-            mint(whitelist[i], amount);
-        }
-        whitelistdropped = true;
-    }
-
+    /**
+     * @dev Mints tokens for the creator after a specified period.
+     */
     function creatordrop() external {
-        require(creatordropped == false, "creator drop already took place");
-        require(block.timestamp > saleStartTime + saleDuration + (86400 * 180), "creator drop not available yet!");
+        if (creatordropped) {
+            revert CreatorDropAlreadyDone();
+        }
+        if (block.timestamp <= saleStartTime + saleDuration + (86400 * 180)) {
+            revert CreatorDropNotAvailable();
+        }
         mint(creator, creatorSupply);
         creatordropped = true;
     }
 
+    /**
+     * @dev Mints the specified amount of tokens to the given address.
+     * @param to The address to mint tokens to.
+     * @param amount The amount of tokens to mint.
+     */
     function mint(address to, uint256 amount) internal {
         _mint(to, amount);
     }
 
+    /**
+     * @dev Handles CLM and DEX calls for liquidity provision and borrowing.
+     */
     function clm_and_dex_calls() internal {
         // Minting cTokens = Supplying to CLM
         for (uint256 i = 0; i < assets.length; i++) {
@@ -164,23 +296,26 @@ contract LaunchPool is ERC20 {
             }
         }
         // Checking Liquidity - Testnet address is being used
-        Comptroller troll = Comptroller(0xA51436eF5D46EE56B0906DeC620466153f7fb77e);
-        (uint256 error, uint256 liquidity, uint256 shortfall) = troll.getAccountLiquidity(address(this));
+        Comptroller troll = Comptroller(
+            0xA51436eF5D46EE56B0906DeC620466153f7fb77e
+        );
+        (uint256 error, uint256 liquidity, uint256 shortfall) = troll
+            .getAccountLiquidity(address(this));
 
-        console.log("Error: ", error);
-        console.log("Liquidity: ", liquidity);
-        console.log("Shortfall: ", shortfall);
+        require(error == 0, "Something went wrong");
+        require(shortfall == 0, "Negative liquidity balance");
+        require(liquidity > 0, "Not enough collateral");
 
-        require(error == 0, "something went wrong");
-        require(shortfall == 0, "negative liquidity balance");
-        require(liquidity > 0, "there's not enough collateral");
         // Borrowing NOTE - Testnet cNOTE address is being used
         CErc20 cNOTE = CErc20(0x04E52476d318CdF739C38BD41A922787D441900c);
         uint256 amt_borrow = liquidity - 1;
-        require(cNOTE.borrow(amt_borrow) == 0, "there is not enough collateral");
+        require(cNOTE.borrow(amt_borrow) == 0, "Not enough collateral");
+
         // Creating new pair on DEX - Testnet address is being used for Router as well as for NOTE
-        BaseV1Router01 testnet_dex = BaseV1Router01(0x463e7d4DF8fE5fb42D024cb57c77b76e6e74417a);
-        (uint256 amountA, uint256 amountB,) = testnet_dex.addLiquidity(
+        BaseV1Router01 testnet_dex = BaseV1Router01(
+            0x463e7d4DF8fE5fb42D024cb57c77b76e6e74417a
+        );
+        (uint256 amountA, uint256 amountB, ) = testnet_dex.addLiquidity(
             address(this),
             0x03F734Bd9847575fDbE9bEaDDf9C166F880B5E5f,
             false,
@@ -192,9 +327,9 @@ contract LaunchPool is ERC20 {
             16725205800
         );
 
-        console.log("Amount A: ", amountA);
-        console.log("Amount B: ", amountB);
-
-        require(amountA == reservedSupply && amountB == amt_borrow, "couldn't add liquidity as required");
+        require(
+            amountA == reservedSupply && amountB == amt_borrow,
+            "Couldn't add liquidity"
+        );
     }
 }
